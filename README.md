@@ -1,7 +1,8 @@
 <!-- # LatentRAG: Latent Reasoning and Retrieval for Efficient Agentic RAG -->
 
 <h1 align="center">
-  <picture title="The blue-to-green gradient represents the continuous latent thought tokens (blue) and latent subquery tokens (green) in the LatentRAG framework.">
+  <picture title="The green and blue gradients represent the latent thought tokens (green) and latent subquery tokens (blue) in the LatentRAG framework.">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/title_dark.svg">
   <img src="assets/title.svg"
        alt="LatentRAG"
        height="32em"
