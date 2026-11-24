@@ -105,7 +105,7 @@ class CustomTrainer(Trainer):
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Saving model checkpoint to {output_dir}")
 
-        self.model.save(output_dir, state_dict=state_dict, save_safetensors=self.args.save_safetensors)
+        self.model.save(output_dir, state_dict=state_dict, save_safetensors=getattr(self.args, "save_safetensors", True))  # transformers 5 removed this arg (always safetensors)
         
         if hasattr(self.model, "encoder") and self.model.encoder is not None:
             encoder_prefix = 'encoder.'
@@ -113,7 +113,7 @@ class CustomTrainer(Trainer):
             if state_dict is not None:
                 encoder_state_dict = {k[len(encoder_prefix):]: v for k, v in state_dict.items() if k.startswith(encoder_prefix)}
             self.model.encoder.save(os.path.join(output_dir, "encoder"), 
-                                    state_dict=encoder_state_dict, save_safetensors=self.args.save_safetensors)
+                                    state_dict=encoder_state_dict, save_safetensors=getattr(self.args, "save_safetensors", True))  # transformers 5 removed this arg (always safetensors)
 
         if self.processing_class is not None:
             self.processing_class.save_pretrained(output_dir)

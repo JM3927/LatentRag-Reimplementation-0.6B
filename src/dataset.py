@@ -194,6 +194,11 @@ def get_dataset(files, config, tokenizer,
         max_seq_length = config.data.get('max_seq_length', 3000)
         data = [item for item in data if len(item['input_ids']) <= max_seq_length]
         logger.info(f"Filtered dataset size after max_seq_length {max_seq_length}: {len(data)}")
+        # Qwen3 port: the config's min_seq_length was never applied; used to memory-test the longest trajectories
+        min_seq_length = config.data.get('min_seq_length', 0) or 0
+        if min_seq_length > 0:
+            data = [item for item in data if len(item['input_ids']) >= min_seq_length]
+            logger.info(f"Filtered dataset size after min_seq_length {min_seq_length}: {len(data)}")
             
         # construct labels
         for item in data:

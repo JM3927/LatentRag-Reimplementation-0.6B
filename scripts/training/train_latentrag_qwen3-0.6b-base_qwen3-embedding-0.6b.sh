@@ -7,6 +7,8 @@ cd "$(dirname "$0")/../.."
 export PYTHONPATH=$PYTHONPATH:$(pwd)/src
 export WANDB_PROJECT="latentrag"
 export WANDB_MODE="${WANDB_MODE:-offline}"
+# 8 GB GPU: reduce fragmentation (variable-length batches)
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
 if [ -z "$RUN_DIR" ]; then
   echo "Set RUN_DIR to the run's output folder first, e.g. RUN_DIR=\$PWD/data/runs/main"

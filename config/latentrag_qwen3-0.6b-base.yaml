@@ -126,6 +126,9 @@ retriever:  # overrides on top of config/retriever/qwen3-embedding-0.6b.yaml
   encoder_lora:
     use_lora: true
   share_encoder: false
+  # 8 GB GPU: read the frozen encoder's targets from disk instead of keeping it on the GPU.
+  # Build with build_reference_cache.py; set to null to use the original on-GPU encoder.
+  reference_cache_path: "data/reference_cache/subset20k_qwen3-embedding-0.6b"
 
 vllm:
   use_vllm: ${gpu_env.vllm.use_vllm}

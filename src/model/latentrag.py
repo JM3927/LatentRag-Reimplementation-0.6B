@@ -373,9 +373,13 @@ class LatentRAG(nn.Module):
     def set_reference_encoder(self, reference_encoder): 
         self.reference_encoder = reference_encoder
         
-    def get_reference_encoder(self): 
+    def get_reference_encoder(self):
         return self.reference_encoder
-            
+
+    # Qwen3-0.6B port: precomputed reference targets (see src/reference_cache.py)
+    def set_reference_cache(self, reference_cache):
+        self.reference_cache = reference_cache
+
     def get_tokenizer(self):
         return self.tokenizer
 
@@ -383,8 +387,9 @@ class LatentRAG(nn.Module):
                 llm_input_batches: Dict[str, Any] = None,
                 retrieval_data: Dict[str, Any] = None) -> TrainingOutput:
         
-        if not self.reference_encoder.trainable: 
+        if self.reference_encoder is not None and not self.reference_encoder.trainable:
             self.reference_encoder.eval() # ensure the target is accurate
+        reference_cache = getattr(self, "reference_cache", None)
             
         if not self.encoder.trainable:
             self.encoder.eval()  # stabilize the training process
@@ -580,12 +585,18 @@ class LatentRAG(nn.Module):
                                             for chunk_items in sublist for chunk_item in chunk_items])
 
             # subquery embeddings
-            flat_subquery_embeddings = self.reference_encoder.single_batch_encode(flat_subqueries, is_query=True, return_tensors=True)
+            if reference_cache is not None:  # precomputed by build_reference_cache.py
+                flat_subquery_embeddings = reference_cache.subqueries(flat_subqueries, device=self.base_model.device)
+            else:
+                flat_subquery_embeddings = self.reference_encoder.single_batch_encode(flat_subqueries, is_query=True, return_tensors=True)
             flat_subquery_embeddings = flat_subquery_embeddings.float() # use float32 for better stability
             normalized_flat_subquery_embeddings = nn.functional.normalize(flat_subquery_embeddings, p=2, dim=-1)
 
             # positive and negative chunk embeddings
-            flat_pos_neg_chunk_embeddings = self.reference_encoder.single_batch_encode(flat_pos_neg_chunk_texts, is_query=False, return_tensors=True)
+            if reference_cache is not None:  # index-shard rows for these chunk ids
+                flat_pos_neg_chunk_embeddings = reference_cache.passages(flat_pos_neg_chunk_ids, device=self.base_model.device)
+            else:
+                flat_pos_neg_chunk_embeddings = self.reference_encoder.single_batch_encode(flat_pos_neg_chunk_texts, is_query=False, return_tensors=True)
             flat_pos_neg_chunk_embeddings = flat_pos_neg_chunk_embeddings.float() # use float32 for better stability
             flat_pos_neg_chunk_embeddings = nn.functional.normalize(flat_pos_neg_chunk_embeddings, p=2, dim=-1)
 

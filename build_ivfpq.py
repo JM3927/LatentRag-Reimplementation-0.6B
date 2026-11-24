@@ -25,8 +25,22 @@ os.makedirs(args.out, exist_ok=True)
 trained_path = os.path.join(args.out, "trained.index")
 partial_path = os.path.join(args.out, "partial.index")
 final_path = os.path.join(args.out, f"wiki18_ivf{args.nlist}_pq{args.m}.index")
+# The released shards are NOT unit length (norm ~104); the repo's retriever L2-normalizes
+# them on load (torch_retriever_gpu.py), i.e. ranks by cosine. So do we. The marker keeps a
+# rerun from resuming files written by the first version of this script, which didn't.
+marker = os.path.join(args.out, "NORMALIZED")
+if not os.path.exists(marker):
+    if any(os.path.exists(f) for f in (trained_path, partial_path, final_path)):
+        raise SystemExit(f"{args.out} holds files built from unnormalized vectors; delete that folder and rerun")
+    open(marker, "w").write("vectors L2-normalized before training and adding\n")
 if os.path.exists(final_path):
     raise SystemExit(f"Already built: {final_path}")
+
+
+def unit(a):
+    a = np.ascontiguousarray(a, dtype=np.float32)
+    faiss.normalize_L2(a)   # in place
+    return a
 
 paths = sorted(glob.glob(os.path.join(args.shards, "shard_index_*.npy")))
 if not paths:
@@ -51,7 +65,9 @@ else:
             parts.append(np.asarray(s[sel], dtype=np.float32))
     x = np.concatenate(parts)
     del parts
-    log(f"training sample {x.shape}; mean vector norm {np.linalg.norm(x[:1000], axis=1).mean():.3f} (expect ~1.0)")
+    log(f"training sample {x.shape}; raw mean vector norm {np.linalg.norm(x[:1000], axis=1).mean():.1f} (released shards: ~104)")
+    x = unit(x)
+    log(f"normalized: mean norm {np.linalg.norm(x[:1000], axis=1).mean():.3f} (expect 1.000)")
     index = faiss.index_factory(d, f"IVF{args.nlist},PQ{args.m}", faiss.METRIC_INNER_PRODUCT)
     faiss.extract_index_ivf(index).verbose = True
     log("training: k-means then PQ codebooks (the longest single step)")
@@ -73,7 +89,7 @@ if os.path.exists(partial_path):
     log(f"resuming at shard {start} with {index.ntotal:,} vectors already added")
 
 for i in range(start, len(shards)):
-    index.add(np.asarray(shards[i], dtype=np.float32))
+    index.add(unit(shards[i]))
     if (i + 1) % args.save_every == 0 and i + 1 < len(shards):
         faiss.write_index(index, partial_path + ".tmp")
         os.replace(partial_path + ".tmp", partial_path)

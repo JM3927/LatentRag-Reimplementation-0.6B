@@ -178,8 +178,17 @@ def main(config: DictConfig):
         encoder = Encoder.build(config, trainable=encoder_trainable, use_lora=encoder_use_lora, custom_encoder=True)
         model.set_encoder(encoder)
     
+    reference_cache_path = config.retriever.get("reference_cache_path", None)
     if config.model.model_class in ("LatentRAG") and config.retriever.get("share_encoder", False):
         reference_encoder = encoder
+    elif reference_cache_path:
+        # Qwen3-0.6B port: targets come from build_reference_cache.py, so the frozen
+        # reference encoder (~1.2 GB) never goes on the GPU
+        from reference_cache import ReferenceEmbeddingCache
+        reference_cache = ReferenceEmbeddingCache(reference_cache_path)
+        logger.info(f"Using {reference_cache} instead of a frozen reference encoder")
+        model.set_reference_cache(reference_cache)
+        reference_encoder = None
     else:
         reference_encoder = Encoder.build(config, trainable=False, use_lora=False)
     model.set_reference_encoder(reference_encoder)  # use the same encoder as reference

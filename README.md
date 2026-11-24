@@ -22,6 +22,79 @@
   University of Amsterdam
 </p>
 
+> **This fork (branch `qwen3-0.6B`)** is an unofficial port of LatentRAG to **Qwen3-0.6B-Base on a single 8 GB GPU** . The port notes come first; the authors' original README follows unchanged from [Overview](#overview).
+
+## Qwen3-0.6B port: notes
+
+### What changed from the official code
+
+| File | Change |
+|---|---|
+| `config/latentrag_qwen3-0.6b-base.yaml` | The authors' 3B config with every setting from their 7B training script moved into the file (4 thought / 16 query slots, `kl_rank_loss`, temperature 0.03, trainable embedder with LoRA, `share_encoder: false`), plus: Qwen3-0.6B-Base, `sdpa` attention, no DeepSpeed, 3 epochs, warmup 100, a full checkpoint every 100 steps, and `reference_cache_path` (below) |
+| `config/gpu_env/latentrag_qwen3-0.6b-base_qwen3-embedding-0.6b/gpu_1_8g.yaml` | Micro-batch 1 × 16 gradient accumulation, learning rate 1e-4 |
+| `scripts/training/train_latentrag_qwen3-0.6b-base_qwen3-embedding-0.6b.sh` | One-GPU training script; requires `RUN_DIR`, passes extra Hydra overrides through, sets `PYTORCH_ALLOC_CONF=expandable_segments:True` to limit fragmentation |
+| `src/train.py` | `RUN_DIR` fixes the output folder and resumes from its latest checkpoint (replaying the per-epoch reshuffle); loads the reference cache when configured |
+| `src/trainer.py` | Every save also writes `trainable_state.pt` (all trainable tensors); `_load_from_checkpoint` restores from it, because the stock loader can't read this model's checkpoints. Unused DeepSpeed import commented out. `self.args.save_safetensors` replaced by `getattr(self.args, "save_safetensors", True)`: transformers 5 removed that argument (it always saves safetensors), and every checkpoint save crashed with `AttributeError` |
+| `src/model/latentrag.py` | Reads alignment targets from the reference cache when one is set; otherwise unchanged |
+| `src/dataset.py` | Applies `data.min_seq_length` (present in the configs but never used), so a memory test can select only the longest trajectories |
+| `src/reference_cache.py`, `build_reference_cache.py` | New: the reference-embedding cache (below) |
+| `make_subsets.py` | Cuts the ~20k training subset (10,250 correct trajectories per train file, seed 42) one file at a time, so RAM stays under 32 GB |
+| `build_ivfpq.py` | Builds a CPU FAISS IVF-PQ index (16,384 lists, 128-byte codes, ~3 GB) from the released fp16 shards, for serving retrieval from RAM instead of ~43 GB of GPU memory. **The released shard vectors are not unit length (mean norm ~104);** the official retriever L2-normalizes them on load (`src/retriever/torch_retriever_gpu.py`), i.e. ranks by cosine, so this script normalizes before training and adding. (Fixed 2026-11-23; an index from the first version, which skipped this, must be deleted and rebuilt.) |
+| `check_trajectories.py`, `smoke_step.py` | Data checks and an LLM-only GPU smoke test |
+
+### Environment
+
+- Python 3.10 venv; the authors' `install.sh` without flash-attn, plus `faiss-cpu`. Exact versions: `requirements-qwen3.txt`.
+- **transformers 5.20.2**, not the 4.57.6 that `install.sh` pins: vLLM 0.17.1 upgrades it. vLLM must be installed because `src/llm_tools/safe_loader.py`, which every model imports, imports it.
+- PyTorch 2.10 (CUDA 12.8 build), which supports Blackwell `sm_120`.
+- **No flash-attn:** PyTorch SDPA everywhere (`attn_implementation: "sdpa"` for the LLM and the embedders).
+- **No DeepSpeed:** importing it requires a CUDA toolkit (`CUDA_HOME`); the trainer's only DeepSpeed import was unused.
+- wandb runs offline (`WANDB_MODE=offline`).
+
+### GPU memory: the reference-embedding cache
+
+**Problem (2026-11-23).** The first overfit test ran out of memory on its first training step. LatentRAG training keeps three Qwen3-0.6B-sized models on the GPU in bf16: the LLM, the trainable embedder, and a *frozen* copy of the embedder (`share_encoder: false`) that only produces target vectors for the alignment loss. Their weights alone take ~3.6 GB. The LLM forward pass (mostly 151k-vocabulary logits over up to 3,000 tokens) brought allocation to 5.9 GB, and the frozen copy's encoding of the step's ~50–70 passages then failed with 87 MB free on the 8 GB card. The first optimizer step would add another ~0.9 GB (gradients and AdamW state for the trainable embedding table), so cutting `max_seq_length` to 2,048 (~0.5 GB) would not have been enough.
+
+**Fix.** The frozen encoder's outputs never change, so they are computed once and read from disk:
+
+- **Passages:** the released index shards *are* the frozen Qwen3-Embedding-0.6B's passage vectors (built by `src/preprocessing/build_index.py` in fp32, stored in fp16), and `chunk_id` = corpus line = index row for all 21,015,324 passages. The cache copies the rows the training subset uses.
+- **Subqueries:** encoded once by the exact encoder `train.py` would build (same Hydra config, bf16, max length 256, same instruction prefix).
+- **Training** reads both through `src/reference_cache.py` and never loads the frozen encoder, freeing ~1.2 GB plus its activations, and skips ~50–70 passage encodings per step.
+
+For the ~20k subset that is 37,311 subqueries and 475,406 passages (~1 GB on disk). Build it once, with nothing else on the GPU:
+
+```fish
+python build_reference_cache.py   # -> data/reference_cache/subset20k_qwen3-embedding-0.6b/
+```
+
+**Check.** The script re-encodes 2,000 random training passages with the frozen encoder and compares them to the cached rows; the results are saved in the cache's `meta.json`:
+
+| Check (built 2026-11-23, 2,000 passages) | Result |
+|---|---|
+| Cosine, cached row vs freshly encoded (mean / 1st percentile / min) | 0.99987 / 0.99982 / 0.9868 |
+| Passages below 0.98 | 0 |
+| Teacher target distribution at temperature 0.03, KL(fresh ‖ cached) | 0.00021 |
+| Same top-1 passage under both | 99.1% |
+
+The build took about 2.5 minutes (passages 20 s from the shards, subqueries 76 s on the GPU).
+
+**Result.** With the cache, a short run on 64 trajectories (micro-batch 1, through three optimizer updates, `PYTORCH_ALLOC_CONF=expandable_segments:True`) peaked at **6,777 MiB of 8,151 MiB** on the 8 GB GPU, including ~470 MiB used by the desktop. Without it, training ran out of memory on step 1. At `max_seq_length` 3,000 the loader keeps 20,499 of the 20,500 subset trajectories.
+
+**Differences from the original behaviour.** Passage targets come from fp32 encoding (the index) rather than on-the-fly bf16, and are not truncated at 256 tokens (wiki-18 passages are ~100 words, so truncation is rare). The alignment loss, its negatives, and everything else are unchanged. To go back to the original on-GPU frozen encoder, pass `retriever.reference_cache_path=null`. A different training set (e.g. the full correct-only data) needs its own cache: `python build_reference_cache.py --src data/reasoning_steps_correct --out data/reference_cache/correct_qwen3-embedding-0.6b`, and point `retriever.reference_cache_path` at it.
+
+### Running it
+
+All commands are fish, from the repo root, after `source env.fish`.
+
+```fish
+python make_subsets.py --no-full          # 1. ~20k training subset (CPU)
+python build_reference_cache.py           # 2. reference cache (a few minutes, GPU)
+python build_ivfpq.py                     # 3. CPU retrieval index (1-3 h, can run during training)
+env RUN_DIR=$PWD/data/runs/main bash scripts/training/train_latentrag_qwen3-0.6b-base_qwen3-embedding-0.6b.sh   # 4. train
+```
+
+Training is resumable: stop it with Ctrl-C and rerun the exact same command (same `RUN_DIR`); it continues from the latest checkpoint (every 100 steps). Extra Hydra overrides go at the end of the command; keys not in the config need a leading `+` (e.g. `+training.max_steps=15`).
+
 ## Overview
 
 This repository contains the official implementation of our NeurIPS 2026 paper: [LatentRAG: Latent Reasoning and Retrieval for Efficient Agentic RAG](https://arxiv.org/abs/2605.06285). LatentRAG is an efficient agentic RAG framework that shifts both reasoning and retrieval from discrete language space to continuous latent space, enabling end-to-end joint optimization of the LLM and the retrieval model while reducing overall latency by approximately 90%.
