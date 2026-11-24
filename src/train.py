@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 import gc
 import hydra
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -123,6 +124,11 @@ def main(config: DictConfig):
         f"{timestamp}{additional_param_tag}",
     )
     
+    # RUN_DIR: fixed output folder so the same command resumes from its latest checkpoint
+    run_dir = os.getenv("RUN_DIR")
+    if run_dir:
+        training_args.output_dir = run_dir
+
     training_args.run_name = (
         f"{timestamp}_train"
         f"_{config.model.model_tag}_{config.retriever.retriever_tag}_{config.data.data_tag}"
@@ -133,6 +139,7 @@ def main(config: DictConfig):
         os.path.exists(training_args.output_dir)
         and os.listdir(training_args.output_dir)
         and not config.training.overwrite_output_dir
+        and not run_dir
     ):
         raise ValueError(
             f"Output directory ({training_args.output_dir}) already exists and is not empty. Use --overwrite_output_dir to clear the existing directory."
@@ -219,7 +226,7 @@ def main(config: DictConfig):
         experiment_config=config, 
     )
 
-    if config.training.overwrite_output_dir and training_args.local_rank == 0:
+    if config.training.overwrite_output_dir and not run_dir and training_args.local_rank == 0:
         if os.path.exists(training_args.output_dir):
             logger.info(f"Cleaning output directory: {training_args.output_dir}")
             shutil.rmtree(training_args.output_dir)
@@ -257,7 +264,18 @@ def main(config: DictConfig):
     trainer.add_callback(WandbConfigUpdateCallback(config))
     
     # trainer.train(resume_from_checkpoint=last_checkpoint)
-    trainer.train()
+    last_checkpoint = None
+    if run_dir and os.path.isdir(training_args.output_dir):
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    if last_checkpoint is not None:
+        logger.info(f"Resuming from {last_checkpoint}")
+        # replay the per-epoch reshuffle so the resumed epoch sees the same batches
+        if getattr(train_dataset, "shuffle", False) and hasattr(train_dataset, "shuffle_and_rebatch"):
+            with open(os.path.join(last_checkpoint, "trainer_state.json")) as f:
+                resumed_epoch = int(json.load(f)["epoch"])
+            if resumed_epoch > 0:
+                train_dataset.shuffle_and_rebatch(resumed_epoch)
+    trainer.train(resume_from_checkpoint=last_checkpoint)
     
     # if wandb.run is not None:
     #     # record wandb_url for tracking

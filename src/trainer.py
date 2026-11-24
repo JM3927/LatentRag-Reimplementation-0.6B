@@ -16,7 +16,7 @@ from transformers.utils import (
 )
 if is_accelerate_available():
     from accelerate.utils import DistributedType
-from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+# from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 from safetensors.torch import save_file, load_file
 
 from model.latentrag import LatentRAG, TrainingOutput
@@ -136,6 +136,24 @@ class CustomTrainer(Trainer):
                     self.experiment_config.wandb_url = wandb_url
             OmegaConf.save(config=self.experiment_config, f=f"{output_dir}/training_config.yaml")
     
+        # every trainable tensor in one file, so a checkpoint can be resumed
+        trainable_state = {n: p.detach().cpu() for n, p in self.model.named_parameters() if p.requires_grad}
+        torch.save(trainable_state, os.path.join(output_dir, "trainable_state.pt"))
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        # The stock loader can't read this model's checkpoints; restore what _save wrote instead.
+        model = self.model if model is None else model
+        path = os.path.join(resume_from_checkpoint, "trainable_state.pt")
+        if not os.path.isfile(path):
+            raise ValueError(f"No trainable_state.pt in {resume_from_checkpoint}; delete that checkpoint folder and rerun")
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+        missing = trainable - set(state)
+        if missing:
+            raise ValueError(f"{len(missing)} trainable tensors missing from {path}, e.g. {sorted(missing)[:3]}")
+        model.load_state_dict(state, strict=False)
+        logger.info(f"Loaded {len(state)} trainable tensors from {path}")
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # # # TODO: for debug, skip early steps to identify bugs at later steps
         # if os.getenv("DEBUG_MODE", "false").lower() == "true": 
