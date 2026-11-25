@@ -1,0 +1,31 @@
+# Retriever server on the IVF-PQ index (Qwen3-0.6B port; src/launch_retriever_server_ivfpq.py).
+# Same REST API as config/retriever_server.yaml, but fits in ~4 GB RAM + ~1.2 GB GPU.
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+defaults:
+  - retriever: qwen3-embedding-0.6b
+  - override hydra/hydra_logging: none
+  - override hydra/job_logging: console_logging
+  - _self_
+
+training:
+  bf16: true
+  seed: 42
+
+retriever:
+  attn_implementation: "sdpa"   # no flash-attn in this environment
+
+ivfpq:
+  index_path: "data/corpus/ivfpq/wiki18_ivf16384_pq128.index"   # from build_ivfpq.py
+  offsets_path: "data/corpus/wiki18_100w.offsets.npy"           # built on first start (~10 s)
+  nprobe: 2048             # IVF lists searched per query (of 16384); see check_retriever_recall.py
+  rerank_candidates: 300   # PQ candidates re-scored exactly against the fp16 shards
+  omp_threads: 8
+  load_encoder: true       # false: embedding mode only, saves ~1.2 GB GPU (LatentRAG eval sends embeddings)
+
+server:
+  host: "127.0.0.1"
+  port: 8001

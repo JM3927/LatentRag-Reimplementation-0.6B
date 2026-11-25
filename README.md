@@ -41,6 +41,8 @@
 | `make_subsets.py` | Cuts the ~20k training subset (10,250 correct trajectories per train file, seed 42) one file at a time, so RAM stays under 32 GB |
 | `build_ivfpq.py` | Builds a CPU FAISS IVF-PQ index (16,384 lists, 128-byte codes, ~3 GB) from the released fp16 shards, for serving retrieval from RAM instead of ~43 GB of GPU memory. **The released shard vectors are not unit length (mean norm ~104);** the official retriever L2-normalizes them on load (`src/retriever/torch_retriever_gpu.py`), i.e. ranks by cosine, so this script normalizes before training and adding. (Fixed 2026-11-23; an index from the first version, which skipped this, must be deleted and rebuilt.) |
 | `check_trajectories.py`, `smoke_step.py` | Data checks and an LLM-only GPU smoke test |
+| `src/retriever/ivfpq_retriever.py`, `src/launch_retriever_server_ivfpq.py`, `config/retriever_server_ivfpq.yaml`, `scripts/launch_retriever_server/launch_qwen3-embedding-0.6b_ivfpq.sh` | New: retrieval server on the IVF-PQ index with exact re-ranking; same REST API as the original server (below) |
+| `check_retriever_recall.py` | New: recall@3 of that server against exact brute-force search |
 
 ### Environment
 
@@ -91,9 +93,56 @@ python make_subsets.py --no-full          # 1. ~20k training subset (CPU)
 python build_reference_cache.py           # 2. reference cache (a few minutes, GPU)
 python build_ivfpq.py                     # 3. CPU retrieval index (1-3 h, can run during training)
 env RUN_DIR=$PWD/data/runs/main bash scripts/training/train_latentrag_qwen3-0.6b-base_qwen3-embedding-0.6b.sh   # 4. train
+bash scripts/launch_retriever_server/launch_qwen3-embedding-0.6b_ivfpq.sh   # 5. retrieval server for eval (below)
 ```
 
 Training is resumable: stop it with Ctrl-C and rerun the exact same command (same `RUN_DIR`); it continues from the latest checkpoint (every 100 steps). Extra Hydra overrides go at the end of the command; keys not in the config need a leading `+` (e.g. `+training.max_steps=15`).
+
+### Main training run (2026-11-23 to 24)
+
+3 epochs over the 20,499-trajectory subset: 3,798 optimizer steps (16 trajectories each), uninterrupted, **16 h 45 min** on the 8 GB GPU (15.9 s/step). Final train loss 0.96. Eval on the held-out split every 200 steps:
+
+| Eval metric | Start | Step 1,800 | End (3,798) |
+|---|---|---|---|
+| Total loss | 16.29 | 1.78 | **1.54** |
+| Alignment top-1 accuracy (latent query picks the reference encoder's top passage) | 0.07 | 0.64 | **0.71** |
+| Alignment KL-rank loss | 1.84 | 0.53 | **0.44** |
+| Subquery self-decoding accuracy | 0.24 | 0.88 | **0.90** |
+| Answer generation loss | 5.13 | 0.20 | **0.20** |
+
+Alignment top-1 stayed low (0.07 to 0.15) for the first 800 steps, jumped between steps 1,000 and 1,400 (0.25 to 0.54), and was still creeping up at the end. Answer-generation eval loss was ~0.23 by step 400 and flattened at ~0.20 from step 1,400, while its train loss kept falling to ~0.10, so epochs 2 and 3 mainly helped alignment.
+
+Kept from the run (`data/runs/main`, 7.7 GB): the final model at the top level, with `trainer_state.json` (full log history), and `checkpoint-600` (~half an epoch), `checkpoint-1300` (~1 epoch), `checkpoint-2500` (~2 epochs). The other 35 checkpoints (~75 GB) were deleted.
+
+### Retrieval server: IVF-PQ with exact re-ranking
+
+The original server (`src/launch_retriever_server.py` + `TorchRetriever`) keeps all 21M fp16 passage vectors in GPU or CPU memory (43 GB) and loads the 14 GB corpus jsonl as Python objects. Neither fits on this machine (8 GB GPU, 30 GB RAM). `src/launch_retriever_server_ivfpq.py` serves the **same REST API** (`GET /retriever_info`, `POST /retrieve` in `text` or `embedding` mode, same response format and chunk ids), so `RESTRetriever` and the eval scripts work unchanged with `retriever.base_url=http://127.0.0.1:8001`. Per query it:
+
+1. encodes the question with Qwen3-Embedding-0.6B (text mode; skipped in embedding mode) and L2-normalizes it;
+2. takes 300 candidates from the CPU FAISS IVF-PQ index (`build_ivfpq.py`), searching 2,048 of the 16,384 lists;
+3. re-scores those candidates exactly against the original fp16 shard vectors, read from disk with `pread` (no readahead, 32 threads), and returns the top k. Scores are therefore the same cosine scores the original server returns;
+4. reads passage text by byte offset into the jsonl (a 168 MB offset table, built on first start in ~10 s).
+
+Memory: ~5 GB RAM, ~1.3 GB GPU for the query encoder (`ivfpq.load_encoder=false` drops it, leaving embedding mode only).
+
+**Recall against exact search** (`check_retriever_recall.py`: 1,000 eval-set questions, 200 each from NQ test, HotpotQA dev, 2Wiki dev, MuSiQue dev, PopQA test, seed 1; ground truth is brute force over all 21M vectors, i.e. what the original server returns):
+
+| Lists searched (nprobe) | recall@3, re-ranking 300 | top-1 same as exact | recall@3, PQ scores only |
+|---|---|---|---|
+| 256 | 0.914 | 0.937 | 0.605 |
+| 512 | 0.954 | 0.968 | 0.615 |
+| 1,024 | 0.974 | 0.980 | 0.619 |
+| **2,048 (server default)** | **0.983** | **0.987** | 0.621 |
+
+**Pass (mark: 0.95).** An earlier setting (64 lists, 100 candidates) gave only 0.79 even though the index found 99.5% of *stored passage vectors* as their own top hit; real question embeddings sit much farther from their passages, so many more lists must be searched. Re-ranking 1,000 candidates instead of 300 added at most 0.003. Without exact re-ranking, recall stalls at ~0.62 however many lists are searched, because the 128-byte PQ codes are too coarse to order close candidates.
+
+Latency (warm, measured through `RESTRetriever`): ~45 ms for a single text query end to end, ~26 ms per query in batches of 128. Two fixes got it there: gathering candidate rows by fancy-indexing memory-mapped shards took ~13 s per 19k rows (each page fault pulled ~128 KB of readahead), which `pread` with readahead off cut to 0.26 s; and FAISS `parallel_mode=1` (split one query's lists across threads) cut single-query search from 113 to 18 ms.
+
+```fish
+bash scripts/launch_retriever_server/launch_qwen3-embedding-0.6b_ivfpq.sh   # serves on 127.0.0.1:8001; ~10 s to start
+python check_retriever_recall.py --n 1000 --seed 1                          # recall check (~2 min, needs the GPU briefly)
+```
+
 
 ## Overview
 
