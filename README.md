@@ -35,7 +35,7 @@
 - [x] Reference-embedding cache so training fits in 8 GB ([details](#gpu-memory-the-reference-embedding-cache))
 - [x] Overfit test, resume test, worst-case memory test (longest trajectories, ~7.5 GB peak)
 - [x] Main training run: 3 epochs, 16 h 45 min ([results](#main-training-run-2026-11-23-to-24))
-- [x] CPU retrieval server with the original REST API, recall@3 = 0.983 against exact search ([details](#retrieval-server-ivf-pq-with-exact-re-ranking))
+- [x] CPU retrieval server with the original REST API, recall@3 = 0.983 against exact search ([details](#retrieval-server-ivf-pq-with-exact-re-ranking)); its index is on Hugging Face as `LatentRAG/wiki18_100w_qwen3-embedding-0.6b_ivfpq` (private dataset repo; [setup table](#setting-up-on-another-machine))
 
 **To do, in order.** Items 1–4 are the evaluation milestone. The rest can be picked up in any order.
 
@@ -66,7 +66,6 @@
 
 **Optional and known issues**
 
-- [ ] Share the IVF-PQ index (`data/corpus/ivfpq/`, 2.9 GB) as a private dataset repo in the `LatentRAG` Hugging Face org, so others can skip the 1–3 h build. Upload `wiki18_ivf16384_pq128.index` together with the `NORMALIZED` marker, because the server refuses to start without it. Then put the download command in the setup table.
 - [ ] Eval answer-generation loss stopped improving around step 1,400 while alignment kept improving. A future run could try 2 epochs, or keep 3 and weight alignment higher.
 - [ ] The `faiss-cpu` wheel falls back to its generic build ("Could not load library with AVX2 support"). An AVX2 build could speed up search; it's not needed at the current ~17 ms per query.
 - [ ] Training exits with the PyTorch warning `destroy_process_group() was not called`. It's harmless (checkpoints and logs are complete), but it could be silenced in `src/train.py`.
@@ -123,7 +122,7 @@ Tested hardware: one 8 GB consumer GPU (NVIDIA Blackwell, `sm_120`), 32 GB RAM. 
 | `reasoning_steps/` | 6.3 GB | `huggingface-cli download zhengyijia142/SearchR1_AutoRefine_reasoning_steps_qwen3-embedding-0.6b --repo-type dataset --local-dir data/reasoning_steps` | training subset |
 | `reasoning_steps_subset20k/` | 0.5 GB | `python make_subsets.py --no-full` | training |
 | `reference_cache/subset20k_qwen3-embedding-0.6b/` | 1.1 GB | `python build_reference_cache.py` (~2.5 min, GPU) | training only |
-| `corpus/ivfpq/` | 2.9 GB | `python build_ivfpq.py` (1–3 h, CPU; must include the `NORMALIZED` marker file it writes). Not shared yet (optional To-Do below) | retrieval server |
+| `corpus/ivfpq/` | 2.9 GB | `hf download LatentRAG/wiki18_100w_qwen3-embedding-0.6b_ivfpq --repo-type dataset --local-dir data/corpus/ivfpq` (private, `LatentRAG` org), or build it: `python build_ivfpq.py` (1–3 h, CPU) | retrieval server |
 | `corpus/wiki18_100w.offsets.npy` | 0.2 GB | built automatically on the server's first start | retrieval server |
 | `runs/main/` | 1.6 GB | `hf download LatentRAG/LatentRAG-Qwen3-0.6B --local-dir data/runs/main` (To-Do item 1), or your own training run | eval |
 
