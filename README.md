@@ -26,6 +26,47 @@
 
 ## Qwen3-0.6B port: notes
 
+### Status and To-Do list (as of 2026-11-24)
+
+**Done**
+
+- [x] Port to Qwen3-0.6B-Base on one 8 GB GPU: configs, one-GPU training script, resumable training ([What changed](#what-changed-from-the-official-code))
+- [x] ~20k-trajectory training subset (`make_subsets.py`)
+- [x] Reference-embedding cache so training fits in 8 GB ([details](#gpu-memory-the-reference-embedding-cache))
+- [x] Overfit test, resume test, worst-case memory test (longest trajectories, ~7.5 GB peak)
+- [x] Main training run: 3 epochs, 16 h 45 min ([results](#main-training-run-2026-11-23-to-24))
+- [x] CPU retrieval server with the original REST API, recall@3 = 0.983 against exact search ([details](#retrieval-server-ivf-pq-with-exact-re-ranking))
+
+**To do, in order.** Items 1–4 are the evaluation milestone. The rest can be picked up in any order.
+
+1. [ ] **Share the trained model** *(repo owner)*. The weights exist only on the training machine (`runs/main`: final model plus `checkpoint-600/1300/2500`, 7.7 GB) and are not in git. Upload at least the final model and `checkpoint-1300` (e.g. a private Hugging Face model repo) and add the download command here. Each folder needs everything `evaluate.py` reads: `training_config.yaml`, the LLM LoRA (`adapter_*`), the three `*_projector.safetensors`, `encoder/` (embedder LoRA) and the tokenizer files.
+2. [ ] **Eval script for this model**: `scripts/evaluation/eval_latentrag_qwen3-0.6b-base.sh`, modelled on `scripts/evaluation/eval_latentrag_qwen2.5-7b-base.sh`:
+   - `LORA_PATH` = the run folder (or a checkpoint folder);
+   - `retriever.base_url='http://127.0.0.1:8001'` (the IVF-PQ server; port 8007 in the original);
+   - drop the authors' `GLOBAL_DATA_PATH`/slurm logic.
+
+   Things to check while doing it:
+   - LatentRAG eval sends subquery **embeddings** (`retrieve_with_embeddings`, `src/evaluate.py:137`), so start the server with `ivfpq.load_encoder=false` to save 1.3 GB of GPU.
+   - `evaluate.py` still loads its own frozen reference encoder when it uses the REST retriever (`src/evaluate.py:222`). That encoder is unused in that case and costs ~1.2 GB of GPU; skip loading it when `retriever.base_url` is set.
+   - `training_config.yaml` carries `retriever.reference_cache_path` (a training-only setting). Confirm that eval ignores it.
+   - Confirm the eval runs under transformers 5.20.2 with `sdpa`. Training needed one fix (`save_safetensors`, see the table below), and eval code paths have not been run yet.
+3. [ ] **Smoke eval**: `checkpoint-1300`, ~200 questions per dataset. `evaluate.py` has no sample limit and the 7 eval files hold ~51k questions, so first add one (e.g. `+data.max_eval_samples`, take the first N after loading) or write small subset files. Do **not** use `checkpoint-600` for this: its alignment top-1 is only 0.14 (vs 0.54 at 1,300 and 0.71 final), so retrieval there is barely trained.
+4. [ ] **Full eval of the final model** on all 7 sets (NQ, TriviaQA, PopQA, HotpotQA, 2Wiki, MuSiQue, Bamboogle). Record EM/F1 per dataset and average retrieval steps in a results table in this README, next to the paper's 3B/7B numbers.
+5. [ ] **Baselines with the same retriever**:
+   - **Direct** (no retrieval): adapt `config/direct_infer_qwen2.5-7b-instruct.yaml`.
+   - **Naive RAG** (retrieve top-3 for the question once, then answer): adapt `config/few_shot_rag_qwen2.5-3b-instruct.yaml`.
+
+   Both use the server's text mode, so keep `ivfpq.load_encoder=true`. Decide and write down which model they use: `Qwen/Qwen3-0.6B-Base`, which matches the LatentRAG backbone, or `Qwen/Qwen3-0.6B`, the post-trained chat model, which is closer to the paper's Instruct baselines.
+6. [ ] **Efficiency comparison**, the paper's main claim: `src/evaluate_with_step_wise_time.py` for LatentRAG vs the text-based baselines. Report retrieval time separately, since this server's latency (~45 ms per query) differs from the original GPU server's.
+7. [ ] **Clean-machine install check.** `requirements-qwen3.txt` is a `pip freeze` of the working venv, and has not yet been installed from scratch on another machine (see [Setting up on another machine](#setting-up-on-another-machine)). Note any fixes here.
+
+**Optional and known issues**
+
+- [ ] Eval answer-generation loss stopped improving around step 1,400 while alignment kept improving. A future run could try 2 epochs, or keep 3 and weight alignment higher.
+- [ ] The `faiss-cpu` wheel falls back to its generic build ("Could not load library with AVX2 support"). An AVX2 build could speed up search; it's not needed at the current ~17 ms per query.
+- [ ] Training exits with the PyTorch warning `destroy_process_group() was not called`. It's harmless (checkpoints and logs are complete), but it could be silenced in `src/train.py`.
+- [ ] Training on the full correct-only data instead of the 20k subset needs its own reference cache (see the cache section), and training time grows in proportion to the data (16.75 h for 20k trajectories × 3 epochs).
+
 ### What changed from the official code
 
 | File | Change |
@@ -43,6 +84,7 @@
 | `check_trajectories.py`, `smoke_step.py` | Data checks and an LLM-only GPU smoke test |
 | `src/retriever/ivfpq_retriever.py`, `src/launch_retriever_server_ivfpq.py`, `config/retriever_server_ivfpq.yaml`, `scripts/launch_retriever_server/launch_qwen3-embedding-0.6b_ivfpq.sh` | New: retrieval server on the IVF-PQ index with exact re-ranking; same REST API as the original server (below) |
 | `check_retriever_recall.py` | New: recall@3 of that server against exact brute-force search |
+| `env.fish`, `env.sh`, `requirements-qwen3.txt` | New: per-session environment (venv, `PYTHONPATH`, offline wandb) for fish or bash/zsh; exact package versions |
 
 ### Environment
 
@@ -52,6 +94,35 @@
 - **No flash-attn:** PyTorch SDPA everywhere (`attn_implementation: "sdpa"` for the LLM and the embedders).
 - **No DeepSpeed:** importing it requires a CUDA toolkit (`CUDA_HOME`); the trainer's only DeepSpeed import was unused.
 - wandb runs offline (`WANDB_MODE=offline`).
+
+### Setting up on another machine
+
+Tested hardware: one 8 GB GPU (8 GB), 30 GB RAM. Disk: ~70 GB of data (table below), plus up to ~85 GB while training, because the config keeps a 2.2 GB checkpoint every 100 steps (`save_total_limit: null`); prune them after the run. Training needs the GPU to itself. The retrieval server needs ~5 GB RAM and, in text mode, ~1.3 GB of GPU.
+
+1. **Code.** Clone this repo; `qwen3-0.6B` is the default branch. `main` is the authors' original code, unchanged.
+2. **Python 3.10 venv** in `.venv` at the repo root, where `env.fish`/`env.sh` expect it:
+   ```bash
+   uv venv -p 3.10 .venv
+   source .venv/bin/activate
+   uv pip install -r requirements-qwen3.txt
+   ```
+   `torch==2.10.0` from PyPI is the CUDA 12.8 build (needed for RTX 50-series / `sm_120`). This exact command hasn't been run on a fresh machine yet (To-Do item 7).
+3. **Per session:** `source env.fish` (fish) or `source env.sh` (bash/zsh).
+4. **Data.** `data/` is gitignored. On the training machine it is a symlink to a separate folder (`data -> data`), which keeps the big files out of the repo; a plain folder works too. The models (Qwen3-0.6B-Base and Qwen3-Embedding-0.6B, ~2.5 GB) download from Hugging Face on first use.
+
+| Path under `data/` | Size | How to get it | Needed for |
+|---|---|---|---|
+| `corpus/wiki18_100w.jsonl` | 14 GB | `cd scripts/preprocessing && bash download_corpus.sh` | everything |
+| `corpus/wiki18_100w_qwen3-embedding-0.6b_fp16_shard/` | 43 GB | `huggingface-cli download zhengyijia142/wiki18_100w_qwen3-embedding-0.6b_fp16_shard --repo-type dataset --local-dir data/corpus/wiki18_100w_qwen3-embedding-0.6b_fp16_shard` | index build, server re-ranking, reference cache |
+| `qa_data/` | 0.7 GB | `cd scripts/preprocessing && bash download_qa_data.sh` | eval |
+| `reasoning_steps/` | 6.3 GB | `huggingface-cli download zhengyijia142/SearchR1_AutoRefine_reasoning_steps_qwen3-embedding-0.6b --repo-type dataset --local-dir data/reasoning_steps` | training subset |
+| `reasoning_steps_subset20k/` | 0.5 GB | `python make_subsets.py --no-full` | training |
+| `reference_cache/subset20k_qwen3-embedding-0.6b/` | 1.1 GB | `python build_reference_cache.py` (~2.5 min, GPU) | training only |
+| `corpus/ivfpq/` | 2.9 GB | `python build_ivfpq.py` (1–3 h, CPU), or copy it from a machine that has it | retrieval server |
+| `corpus/wiki18_100w.offsets.npy` | 0.2 GB | built automatically on the server's first start | retrieval server |
+| `runs/` | 7.7 GB per run | training output (To-Do item 1 for the existing run) | eval |
+
+For **evaluation only** you need the corpus, the shards, `qa_data/`, the IVF-PQ index and a trained run: no training data and no reference cache.
 
 ### GPU memory: the reference-embedding cache
 
@@ -86,7 +157,7 @@ The build took about 2.5 minutes (passages 20 s from the shards, subqueries 76 s
 
 ### Running it
 
-All commands are fish, from the repo root, after `source env.fish`.
+All commands run from the repo root after `source env.fish` (fish) or `source env.sh` (bash/zsh), and work the same in both shells.
 
 ```fish
 python make_subsets.py --no-full          # 1. ~20k training subset (CPU)
