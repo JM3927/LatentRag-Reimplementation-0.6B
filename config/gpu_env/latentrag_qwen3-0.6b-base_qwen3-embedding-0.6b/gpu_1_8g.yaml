@@ -1,4 +1,4 @@
-# One 8 GB GPU (8 GB): micro-batch 1 x 16 accumulation = effective batch 16
+# One 8 GB GPU: micro-batch 1 x 16 accumulation = effective batch 16
 num_gpus: 1
 
 vllm:

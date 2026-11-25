@@ -22,7 +22,7 @@
   University of Amsterdam
 </p>
 
-> **This fork (branch `qwen3-0.6B`)** is an unofficial port of LatentRAG to **Qwen3-0.6B-Base on a single 8 GB GPU** . The port notes come first; the authors' original README follows unchanged from [Overview](#overview).
+> **This fork (branch `qwen3-0.6B`)** is an unofficial port of LatentRAG to **Qwen3-0.6B-Base on a single 8 GB GPU**. The port notes come first; the authors' original README follows unchanged from [Overview](#overview).
 
 ## Qwen3-0.6B port: notes
 
@@ -39,7 +39,11 @@
 
 **To do, in order.** Items 1–4 are the evaluation milestone. The rest can be picked up in any order.
 
-1. [ ] **Share the trained model** *(repo owner)*. The weights exist only on the training machine (`runs/main`: final model plus `checkpoint-600/1300/2500`, 7.7 GB) and are not in git. Upload at least the final model and `checkpoint-1300` (e.g. a private Hugging Face model repo) and add the download command here. Each folder needs everything `evaluate.py` reads: `training_config.yaml`, the LLM LoRA (`adapter_*`), the three `*_projector.safetensors`, `encoder/` (embedder LoRA) and the tokenizer files.
+1. [x] **Share the trained model.** Uploaded to the private Hugging Face repo `LatentRAG/LatentRAG-Qwen3-0.6B` (1.6 GB): the final model (step 3,798) at the top level and `checkpoint-1300/`, each with everything `evaluate.py` reads (`training_config.yaml`, LLM LoRA `adapter_*`, the three `*_projector.safetensors`, `encoder/` and the tokenizer files). Optimizer state is not included, so these can't be used to resume training. Access: ask to be added to the `LatentRAG` organization on Hugging Face, then `hf auth login` and
+   ```bash
+   hf download LatentRAG/LatentRAG-Qwen3-0.6B --local-dir data/runs/main
+   ```
+   The paths in `training_config.yaml` are relative to the repo root (`data/...`), so run eval from there.
 2. [ ] **Eval script for this model**: `scripts/evaluation/eval_latentrag_qwen3-0.6b-base.sh`, modelled on `scripts/evaluation/eval_latentrag_qwen2.5-7b-base.sh`:
    - `LORA_PATH` = the run folder (or a checkpoint folder);
    - `retriever.base_url='http://127.0.0.1:8001'` (the IVF-PQ server; port 8007 in the original);
@@ -97,7 +101,7 @@
 
 ### Setting up on another machine
 
-Tested hardware: one 8 GB GPU (8 GB), 30 GB RAM. Disk: ~70 GB of data (table below), plus up to ~85 GB while training, because the config keeps a 2.2 GB checkpoint every 100 steps (`save_total_limit: null`); prune them after the run. Training needs the GPU to itself. The retrieval server needs ~5 GB RAM and, in text mode, ~1.3 GB of GPU.
+Tested hardware: one 8 GB consumer GPU (NVIDIA Blackwell, `sm_120`), 32 GB RAM. Disk: ~70 GB of data (table below), plus up to ~85 GB while training, because the config keeps a 2.2 GB checkpoint every 100 steps (`save_total_limit: null`); prune them after the run. Training needs the GPU to itself. The retrieval server needs ~5 GB RAM and, in text mode, ~1.3 GB of GPU.
 
 1. **Code.** Clone this repo; `qwen3-0.6B` is the default branch. `main` is the authors' original code, unchanged.
 2. **Python 3.10 venv** in `.venv` at the repo root, where `env.fish`/`env.sh` expect it:
@@ -108,7 +112,7 @@ Tested hardware: one 8 GB GPU (8 GB), 30 GB RAM. Disk: ~70 GB of data (table bel
    ```
    `torch==2.10.0` from PyPI is the CUDA 12.8 build (needed for RTX 50-series / `sm_120`). This exact command hasn't been run on a fresh machine yet (To-Do item 7).
 3. **Per session:** `source env.fish` (fish) or `source env.sh` (bash/zsh).
-4. **Data.** `data/` is gitignored. On the training machine it is a symlink to a separate folder (`data -> data`), which keeps the big files out of the repo; a plain folder works too. The models (Qwen3-0.6B-Base and Qwen3-Embedding-0.6B, ~2.5 GB) download from Hugging Face on first use.
+4. **Data.** `data/` is gitignored. It can be a plain folder or a symlink to a folder elsewhere (e.g. on a bigger disk), which keeps the big files out of the repo. The models (Qwen3-0.6B-Base and Qwen3-Embedding-0.6B, ~2.5 GB) download from Hugging Face on first use.
 
 | Path under `data/` | Size | How to get it | Needed for |
 |---|---|---|---|
@@ -120,7 +124,7 @@ Tested hardware: one 8 GB GPU (8 GB), 30 GB RAM. Disk: ~70 GB of data (table bel
 | `reference_cache/subset20k_qwen3-embedding-0.6b/` | 1.1 GB | `python build_reference_cache.py` (~2.5 min, GPU) | training only |
 | `corpus/ivfpq/` | 2.9 GB | `python build_ivfpq.py` (1–3 h, CPU), or copy it from a machine that has it | retrieval server |
 | `corpus/wiki18_100w.offsets.npy` | 0.2 GB | built automatically on the server's first start | retrieval server |
-| `runs/` | 7.7 GB per run | training output (To-Do item 1 for the existing run) | eval |
+| `runs/main/` | 1.6 GB | `hf download LatentRAG/LatentRAG-Qwen3-0.6B --local-dir data/runs/main` (To-Do item 1), or your own training run | eval |
 
 For **evaluation only** you need the corpus, the shards, `qa_data/`, the IVF-PQ index and a trained run: no training data and no reference cache.
 
@@ -183,11 +187,11 @@ Training is resumable: stop it with Ctrl-C and rerun the exact same command (sam
 
 Alignment top-1 stayed low (0.07 to 0.15) for the first 800 steps, jumped between steps 1,000 and 1,400 (0.25 to 0.54), and was still creeping up at the end. Answer-generation eval loss was ~0.23 by step 400 and flattened at ~0.20 from step 1,400, while its train loss kept falling to ~0.10, so epochs 2 and 3 mainly helped alignment.
 
-Kept from the run (`data/runs/main`, 7.7 GB): the final model at the top level, with `trainer_state.json` (full log history), and `checkpoint-600` (~half an epoch), `checkpoint-1300` (~1 epoch), `checkpoint-2500` (~2 epochs). The other 35 checkpoints (~75 GB) were deleted.
+The final model and `checkpoint-1300` (~1 epoch) are on Hugging Face as `LatentRAG/LatentRAG-Qwen3-0.6B` (private; see To-Do item 1). The other checkpoints were deleted, except `checkpoint-600` (~half an epoch) and `checkpoint-2500` (~2 epochs), which were kept locally but not uploaded.
 
 ### Retrieval server: IVF-PQ with exact re-ranking
 
-The original server (`src/launch_retriever_server.py` + `TorchRetriever`) keeps all 21M fp16 passage vectors in GPU or CPU memory (43 GB) and loads the 14 GB corpus jsonl as Python objects. Neither fits on this machine (8 GB GPU, 30 GB RAM). `src/launch_retriever_server_ivfpq.py` serves the **same REST API** (`GET /retriever_info`, `POST /retrieve` in `text` or `embedding` mode, same response format and chunk ids), so `RESTRetriever` and the eval scripts work unchanged with `retriever.base_url=http://127.0.0.1:8001`. Per query it:
+The original server (`src/launch_retriever_server.py` + `TorchRetriever`) keeps all 21M fp16 passage vectors in GPU or CPU memory (43 GB) and loads the 14 GB corpus jsonl as Python objects. Neither fits on the target machine (8 GB GPU, 32 GB RAM). `src/launch_retriever_server_ivfpq.py` serves the **same REST API** (`GET /retriever_info`, `POST /retrieve` in `text` or `embedding` mode, same response format and chunk ids), so `RESTRetriever` and the eval scripts work unchanged with `retriever.base_url=http://127.0.0.1:8001`. Per query it:
 
 1. encodes the question with Qwen3-Embedding-0.6B (text mode; skipped in embedding mode) and L2-normalizes it;
 2. takes 300 candidates from the CPU FAISS IVF-PQ index (`build_ivfpq.py`), searching 2,048 of the 16,384 lists;
